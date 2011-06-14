@@ -1,0 +1,6 @@
+Makefile
+*.o
+*.cache
+*.log
+*.status
+ssmtp
