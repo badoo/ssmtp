@@ -36,7 +36,9 @@
 #include "md5auth/hmac_md5.h"
 #endif
 #include "ssmtp.h"
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include "xgethostname.h"
 
 bool_t have_date = False;
@@ -72,6 +74,10 @@ char *uad = NULL;
 char *config_file = NULL;		/* alternate configuration file */
 
 headers_t headers, *ht;
+
+int connect_timeout = 3000; /* 3 sec */
+int read_timeout = 3000; /* 3 sec */
+int write_timeout = 3000; /* 3 sec */
 
 #ifdef DEBUG
 int log_level = 1;
@@ -136,6 +142,35 @@ ssize_t smtp_write(int fd, char *format, ...);
 int smtp_read(int fd, char *response);
 int smtp_read_all(int fd, char *response);
 int smtp_okay(int fd, char *response);
+
+enum {
+	SSMTP_POLL_SUCCESS,
+	SSMTP_POLL_FAILURE,
+	SSMTP_POLL_TIMEOUT
+};
+
+int ssmtp_poll(int sock, int op, int timeout_msec) /* {{{ */
+{
+	struct pollfd fds[1];
+	int poll_res;
+
+	memset(&fds, 0, sizeof(struct pollfd));
+	fds[0].fd = sock;
+	fds[0].events = op | POLLERR;
+
+	errno = 0;
+	poll_res = poll(fds, 1, timeout_msec);
+
+	switch (poll_res) {
+		case 0: /* timeout */
+			return SSMTP_POLL_TIMEOUT;
+		case 1: /* success */
+			return SSMTP_POLL_SUCCESS;
+	}
+	/* error */
+	return SSMTP_POLL_FAILURE;
+}
+/* }}} */
 
 /*
 dead_letter() -- Save stdin to ~/dead.letter if possible
@@ -1086,6 +1121,18 @@ bool_t read_config()
 					log_level = 0;
 				}
 			}
+			else if (strcasecmp(p, "ConnectTimeout") == 0)
+			{
+				connect_timeout = atoi(q); 
+			}
+			else if (strcasecmp(p, "ReadTimeout") == 0)
+			{
+				read_timeout = atoi(q); 
+			}
+			else if (strcasecmp(p, "WriteTimeout") == 0)
+			{
+				write_timeout = atoi(q); 
+			}
 			else {
 				log_event(LOG_INFO, "Unable to set %s=\"%s\"\n", p, q);
 			}
@@ -1112,6 +1159,7 @@ int smtp_open(char *host, int port)
 	struct hostent *hent;
 	int i, s, namelen;
 #endif
+	int fd_flags;
 
 #ifdef HAVE_SSL
 	int err;
@@ -1168,12 +1216,41 @@ int smtp_open(char *host, int port)
 			continue;
 		}
 
-		if (connect(s, ai->ai_addr, ai->ai_addrlen) < 0) {
+		fd_flags = fcntl(s, F_GETFL, 0);
+		if (fcntl(s, F_SETFL, fd_flags | O_NONBLOCK) != 0) {
 			s = -1;
 			continue;
 		}
-		break;
+
+		while (1) {
+			if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0) {
+				goto out_of_loop;
+			}
+
+			switch(errno) {
+				case EALREADY:
+				case EINPROGRESS:
+					{
+						int poll_res;
+
+						poll_res = ssmtp_poll(s, POLLOUT, connect_timeout);
+						if (poll_res == SSMTP_POLL_SUCCESS) {
+							/* try again */
+							continue;
+						}
+						s = -1;
+						goto out_of_loop;
+					}
+				case EINTR:
+					continue;
+				default:
+					s = -1;
+					goto out_of_loop;
+			}
+		}
 	}
+
+out_of_loop:
 
 	if(s < 0) {
 		log_event (LOG_ERR,
@@ -1199,21 +1276,57 @@ int smtp_open(char *host, int port)
 		return(-1);
 	}
 
+	fd_flags = fcntl(s, F_GETFL, 0);
+	if (fcntl(s, F_SETFL, fd_flags | O_NONBLOCK) != 0) {
+		log_event(LOG_ERR, "fcntl() failed: %s", strerror(errno));
+		return(-1);
+	}
+
 	for (i = 0; ; ++i) {
 		if (!hent->h_addr_list[i]) {
 			log_event(LOG_ERR, "Unable to connect to %s:%d", host, port);
 			return(-1);
 		}
 
-	/* This SHOULD already be in Network Byte Order from gethostbyname() */
-	name.sin_addr.s_addr = ((struct in_addr *)(hent->h_addr_list[i]))->s_addr;
-	name.sin_family = hent->h_addrtype;
-	name.sin_port = htons(port);
+		/* This SHOULD already be in Network Byte Order from gethostbyname() */
+		name.sin_addr.s_addr = ((struct in_addr *)(hent->h_addr_list[i]))->s_addr;
+		name.sin_family = hent->h_addrtype;
+		name.sin_port = htons(port);
 
-	namelen = sizeof(struct sockaddr_in);
-	if(connect(s, (struct sockaddr *)&name, namelen) < 0)
-		continue;
-	break;
+		namelen = sizeof(struct sockaddr_in);
+
+		while (1) {
+			if(connect(s, (struct sockaddr *)&name, namelen) == 0) {
+				goto out_of_loop;
+			}
+
+			switch(errno) {
+				case EALREADY:
+				case EINPROGRESS:
+					{
+						int poll_res;
+
+						poll_res = ssmtp_poll(s, POLLOUT, connect_timeout);
+						if (poll_res == SSMTP_POLL_SUCCESS) {
+							/* try again */
+							continue;
+						}
+						s = -1;
+						goto out_of_loop;
+					}
+				case EINTR:
+					continue;
+				default:
+					s = -1;
+					goto out_of_loop;
+			}
+		}
+	}
+
+out_of_loop:
+	if (s < 0) {
+		log_event(LOG_ERR, "Unable to connect to %s:%d", host, port);
+		return(-1);
 	}
 #endif
 
@@ -1284,12 +1397,37 @@ fd_getc() -- Read a character from an fd
 */
 ssize_t fd_getc(int fd, void *c)
 {
+	int read_bytes;
+
+	while (1) {
 #ifdef HAVE_SSL
-	if(use_tls == True) { 
-		return(SSL_read(ssl, c, 1));
-	}
+		if(use_tls == True) { 
+			read_bytes = SSL_read(ssl, c, 1);
+		} else {
 #endif
-	return(read(fd, c, 1));
+			read_bytes = read(fd, c, 1);
+#ifdef HAVE_SSL
+		}
+#endif
+		if (read_bytes == -1) {
+			switch (errno) {
+				case EAGAIN:
+					{
+						int res;
+
+						res = ssmtp_poll(fd, POLLIN, read_timeout);
+						if (res == SSMTP_POLL_SUCCESS) {
+							continue;
+						}
+						return -1;
+					}
+				default:
+					return -1;
+			}
+		} else {
+			return read_bytes;
+		}
+	}
 }
 
 /*
@@ -1351,12 +1489,41 @@ fd_puts() -- Write characters to fd
 */
 ssize_t fd_puts(int fd, const void *buf, size_t count) 
 {
+	int written_bytes, written_bytes_total = 0;
+
+	while (count > 0) {
 #ifdef HAVE_SSL
-	if(use_tls == True) { 
-		return(SSL_write(ssl, buf, count));
-	}
+		if(use_tls == True) { 
+			written_bytes = SSL_write(ssl, buf, count);
+		} else {
 #endif
-	return(write(fd, buf, count));
+			written_bytes = write(fd, buf, count);
+#ifdef HAVE_SSL
+		}
+#endif
+
+		if (written_bytes == -1) {
+			switch (errno) {
+				case EAGAIN:
+					{
+						int res;
+
+						res = ssmtp_poll(fd, POLLOUT, write_timeout);
+						if (res == SSMTP_POLL_SUCCESS) {
+							continue;
+						}
+						return -1;
+					}
+				default:
+					return -1;
+			}
+
+		} else {
+			written_bytes_total += written_bytes;
+			count -= written_bytes;
+		}
+	}
+	return written_bytes_total;
 }
 
 /*
