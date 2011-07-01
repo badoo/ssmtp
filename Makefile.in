@@ -24,7 +24,7 @@ INSTALLED_REVALIASES_FILE=$(REVALIASES_FILE)
 # Programs
 GEN_CONFIG=$(srcdir)/generate_config
 
-SRCS=ssmtp.c arpadate.c base64.c xgethostname.c @SRCS@
+SRCS=ssmtp.c arpadate.c base64.c @SRCS@
 
 OBJS=$(SRCS:.c=.o)
 
@@ -36,7 +36,7 @@ EXTRADEFS=\
 -DREVALIASES_FILE=\"$(REVALIASES_FILE)\" \
 
 
-CFLAGS=@DEFS@ $(EXTRADEFS) @CFLAGS@
+CFLAGS=-Wall @DEFS@ $(EXTRADEFS) @CFLAGS@
 
 .PHONY: all
 all: ssmtp
@@ -79,7 +79,7 @@ uninstall-sendmail: uninstall
 
 # Binaries:
 ssmtp: $(OBJS)
-	$(CC) -o ssmtp $(OBJS) @LIBS@ $(CFLAGS)
+	$(CC) -o ssmtp $(OBJS) @LIBS@
 
 .PHONY: clean
 clean:

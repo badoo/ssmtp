@@ -24,8 +24,8 @@ AC_C_CONST
 AC_STRUCT_TM
 
 dnl Checks for libraries.
-AC_SEARCH_LIBS(gethostname, nsl)
-AC_SEARCH_LIBS(socket, socket)
+AC_CHECK_LIB(nsl, gethostname)
+AC_CHECK_LIB(socket, socket)
 
 dnl Checks for library functions.
 AC_TYPE_SIGNAL

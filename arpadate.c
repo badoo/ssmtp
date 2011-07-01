@@ -79,8 +79,7 @@ get_arpadate (char *d_string)
 	time_t now;
 
 	/* RFC822 format string borrowed from GNU shellutils date.c */
-	/* Using %d instead of %_d, the second one isn't portable */
-	const char *format = "%a, %d %b %Y %H:%M:%S %z";
+	const char *format = "%a, %_d %b %Y %H:%M:%S %z";
 
 	now = time(NULL);
 

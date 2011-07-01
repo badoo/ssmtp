@@ -1,5 +1,7 @@
 /*
 
+ $Id: ssmtp.c,v 2.60 2003/08/17 14:17:57 matt Exp $
+
  sSMTP -- send messages via SMTP to a mailhub for local delivery or forwarding.
  This program is used in place of /usr/sbin/sendmail, called by "mail" (et all).
  sSMTP does a selected subset of sendmail's standard tasks (including exactly
@@ -10,8 +12,7 @@
  See COPYRIGHT for the license
 
 */
-#define VERSION "2.64"
-#define _GNU_SOURCE
+#define VERSION "2.60.4"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -35,11 +36,14 @@
 #ifdef MD5AUTH
 #include "md5auth/hmac_md5.h"
 #endif
-#include "ssmtp.h"
-#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include "xgethostname.h"
+#include <errno.h>
+#include "ssmtp.h"
+
+#define CONNECT_TIMEOUT
+#define READ_TIMEOUT
+#define WRITE_TIMEOUT
 
 bool_t have_date = False;
 bool_t have_from = False;
@@ -53,7 +57,6 @@ bool_t rewrite_domain = False;
 bool_t use_tls = False;			/* Use SSL to transfer mail to HUB */
 bool_t use_starttls = False;		/* SSL only after STARTTLS (RFC2487) */
 bool_t use_cert = False;		/* Use a certificate to transfer SSL mail */
-bool_t use_oldauth = False;		/* use old AUTH LOGIN username style */
 
 #define ARPADATE_LENGTH 32		/* Current date in RFC format */
 char arpadate[ARPADATE_LENGTH];
@@ -62,7 +65,7 @@ char *auth_pass = NULL;
 char *auth_method = NULL;		/* Mechanism for SMTP authentication */
 char *mail_domain = NULL;
 char *from = NULL;		/* Use this as the From: address */
-char *hostname;
+char hostname[MAXHOSTNAMELEN] = "localhost";
 char *mailhost = "mailhub";
 char *minus_f = NULL;
 char *minus_F = NULL;
@@ -71,13 +74,12 @@ char *prog = NULL;
 char *root = NULL;
 char *tls_cert = "/etc/ssl/certs/ssmtp.pem";	/* Default Certificate */
 char *uad = NULL;
-char *config_file = NULL;		/* alternate configuration file */
-
-headers_t headers, *ht;
 
 int connect_timeout = 3000; /* 3 sec */
 int read_timeout = 3000; /* 3 sec */
 int write_timeout = 3000; /* 3 sec */
+
+headers_t headers, *ht;
 
 #ifdef DEBUG
 int log_level = 1;
@@ -101,7 +103,36 @@ SSL *ssl;
 static char hextab[]="0123456789abcdef";
 #endif
 
-ssize_t outbytes;
+static char *config_file_path = CONFIGURATION_FILE;
+
+enum {
+	SSMTP_POLL_SUCCESS,
+	SSMTP_POLL_FAILURE,
+	SSMTP_POLL_TIMEOUT
+};
+
+int ssmtp_poll(int sock, int op, int timeout_msec) /* {{{ */
+{
+	struct pollfd fds[1];
+	int poll_res;
+
+	memset(&fds, 0, sizeof(struct pollfd));
+	fds[0].fd = sock;
+	fds[0].events = op | POLLERR;
+
+	errno = 0;
+	poll_res = poll(fds, 1, timeout_msec);
+
+	switch (poll_res) {
+		case 0: /* timeout */
+			return SSMTP_POLL_TIMEOUT;
+		case 1: /* success */
+			return SSMTP_POLL_SUCCESS;
+	}
+	/* error */
+	return SSMTP_POLL_FAILURE;
+}
+/* }}} */
 
 /*
 log_event() -- Write event to syslog (or log file if defined)
@@ -138,47 +169,17 @@ void log_event(int priority, char *format, ...)
 #endif
 }
 
-ssize_t smtp_write(int fd, char *format, ...);
+void smtp_write(int fd, char *format, ...);
 int smtp_read(int fd, char *response);
 int smtp_read_all(int fd, char *response);
 int smtp_okay(int fd, char *response);
-
-enum {
-	SSMTP_POLL_SUCCESS,
-	SSMTP_POLL_FAILURE,
-	SSMTP_POLL_TIMEOUT
-};
-
-int ssmtp_poll(int sock, int op, int timeout_msec) /* {{{ */
-{
-	struct pollfd fds[1];
-	int poll_res;
-
-	memset(&fds, 0, sizeof(struct pollfd));
-	fds[0].fd = sock;
-	fds[0].events = op | POLLERR;
-
-	errno = 0;
-	poll_res = poll(fds, 1, timeout_msec);
-
-	switch (poll_res) {
-		case 0: /* timeout */
-			return SSMTP_POLL_TIMEOUT;
-		case 1: /* success */
-			return SSMTP_POLL_SUCCESS;
-	}
-	/* error */
-	return SSMTP_POLL_FAILURE;
-}
-/* }}} */
 
 /*
 dead_letter() -- Save stdin to ~/dead.letter if possible
 */
 void dead_letter(void)
 {
-	char *path;
-	char buf[(BUF_SZ + 1)];
+	char path[(MAXPATHLEN + 1)], buf[(BUF_SZ + 1)];
 	struct passwd *pw;
 	uid_t uid;
 	FILE *fp;
@@ -189,7 +190,7 @@ void dead_letter(void)
 	if(isatty(fileno(stdin))) {
 		if(log_level > 0) {
 			log_event(LOG_ERR,
-				"stdin is a TTY - not saving to %s/dead.letter", pw->pw_dir);
+				"stdin is a TTY - not saving to %s/dead.letter, pw->pw_dir");
 		}
 		return;
 	}
@@ -202,21 +203,16 @@ void dead_letter(void)
 		return;
 	}
 
-#define DEAD_LETTER "/dead.letter"
-	path = malloc (strlen (pw->pw_dir) + sizeof (DEAD_LETTER));
-	if (!path) {
+	if(snprintf(path, BUF_SZ, "%s/dead.letter", pw->pw_dir) == -1) {
 		/* Can't use die() here since dead_letter() is called from die() */
 		exit(1);
 	}
-	memcpy (path, pw->pw_dir, strlen (pw->pw_dir));
-	memcpy (path + strlen (pw->pw_dir), DEAD_LETTER, sizeof (DEAD_LETTER));
-	
+
 	if((fp = fopen(path, "a")) == (FILE *)NULL) {
 		/* Perhaps the person doesn't have a homedir... */
 		if(log_level > 0) {
 			log_event(LOG_ERR, "Can't open %s failing horribly!", path);
 		}
-		free(path);
 		return;
 	}
 
@@ -233,7 +229,6 @@ void dead_letter(void)
 				"Can't close %s/dead.letter, possibly truncated", pw->pw_dir);
 		}
 	}
-	free(path);
 }
 
 /*
@@ -257,22 +252,27 @@ void die(char *format, ...)
 	exit(1);
 }
 
-#ifndef _GNU_SOURCE
 /*
 basename() -- Return last element of path
 */
 char *basename(char *str)
 {
-	char *p;
+	char buf[MAXPATHLEN +1], *p;
 
-	p = strrchr(str, '/');
-	if (!p) {
-		p = str;
+	if((p = strrchr(str, '/'))) {
+		if(strncpy(buf, ++p, MAXPATHLEN) == (char *)NULL) {
+			die("basename() -- strncpy() failed");
+		}
 	}
+	else {
+		if(strncpy(buf, str, MAXPATHLEN) == (char *)NULL) {
+			die("basename() -- strncpy() failed");
+		}
+	}
+	buf[MAXPATHLEN] = '\0';
 
-	return(strdup(p));
+	return(strdup(buf));
 }
-#endif /* _GNU_SOURCE */
 
 /*
 strip_pre_ws() -- Return pointer to first non-whitespace character
@@ -296,7 +296,7 @@ char *strip_post_ws(char *str)
 
 	p = (str + strlen(str));
 	while(isspace(*--p)) {
-		*p = 0;
+		*p = '\0';
 	}
 
 	return(p);
@@ -322,7 +322,7 @@ char *addr_parse(char *str)
 		q++;
 
 		if((p = strchr(q, '>'))) {
-			*p = 0;
+			*p = '\0';
 		}
 
 #if 0
@@ -345,7 +345,7 @@ char *addr_parse(char *str)
 	q = strip_post_ws(p);
 	if(*q == ')') {
 		while((*--q != '('));
-		*q = 0;
+		*q = '\0';
 	}
 	(void)strip_post_ws(p);
 
@@ -382,25 +382,28 @@ char *append_domain(char *str)
 /*
 standardise() -- Trim off '\n's and double leading dots
 */
-bool_t standardise(char *str, bool_t *linestart)
+void standardise(char *str)
 {
+	size_t sl;
 	char *p;
-	bool_t leadingdot = False;
-
-	/* Any line beginning with a dot has an additional dot inserted;
-	not just a line consisting solely of a dot. Thus we have to move
-	the buffer start up one */
-
-	if(*linestart && *str == '.') {
-		leadingdot = True;
-	}
-	*linestart = False;
 
 	if((p = strchr(str, '\n'))) {
-		*p = 0;
-		*linestart = True;
+		*p = '\0';
 	}
-	return(leadingdot);
+
+	/* Any line beginning with a dot has an additional dot inserted;
+	not just a line consisting solely of a dot. Thus we have to slide
+	the buffer down one */
+	sl = strlen(str);
+
+	if(*str == '.') {
+		if((sl + 2) > BUF_SZ) {
+			die("standardise() -- Buffer overflow");
+		}
+		(void)memmove((str + 1), str, (sl + 1));	/* Copy trailing \0 */
+
+		*str = '.';
+	}
 }
 
 /*
@@ -418,7 +421,7 @@ void revaliases(struct passwd *pw)
 		while(fgets(buf, sizeof(buf), fp)) {
 			/* Make comments invisible */
 			if((p = strchr(buf, '#'))) {
-				*p = 0;
+				*p = '\0';
 			}
 
 			/* Ignore malformed lines and comments */
@@ -517,11 +520,6 @@ char *from_format(char *str, bool_t override_from)
 				die("from_format() -- snprintf() failed");
 			}
 		}
-		else {
-			if(snprintf(buf, BUF_SZ, "%s", str) == -1) {
-				die("from_format() -- snprintf() failed");
-			}
-		}
 	}
 
 #if 0
@@ -553,7 +551,7 @@ void rcpt_save(char *str)
 #endif
 
 	/* Ignore missing usernames */
-	if(*str == 0) {
+	if(*str == '\0') {
 		return;
 	}
 
@@ -610,7 +608,7 @@ void rcpt_parse(char *str)
 		}
 
 		/* End of string? */
-		if(*(q + 1) == 0) {
+		if(*(q + 1) == '\0') {
 			got_addr = True;
 		}
 
@@ -618,7 +616,7 @@ void rcpt_parse(char *str)
 		if((*q == ',') && (in_quotes == False)) {
 			got_addr = True;
 
-			*q = 0;
+			*q = '\0';
 		}
 
 		if(got_addr) {
@@ -710,7 +708,7 @@ void header_save(char *str)
 	if(strncasecmp(ht->string, "From:", 5) == 0) {
 #if 1
 		/* Hack check for NULL From: line */
-		if(*(p + 6) == 0) {
+		if(*(p + 6) == '\0') {
 			return;
 		}
 #endif
@@ -743,10 +741,6 @@ void header_save(char *str)
 		else if(strncasecmp(ht->string, "Bcc:", 4) == 0) {
 			p = (ht->string + 4);
 			rcpt_parse(p);
-                        /* Undo adding the header to the list: */
-                        free(ht->string);
-                        ht->string = NULL;
-                        return;
 		}
 		else if(strncasecmp(ht->string, "CC:", 3) == 0) {
 			p = (ht->string + 3);
@@ -810,9 +804,9 @@ void header_parse(FILE *stream)
 						in_header = False;
 
 				default:
-						*q = 0;
+						*q = '\0';
 						if((q = strrchr(p, '\n'))) {
-							*q = 0;
+							*q = '\0';
 						}
 						header_save(p);
 
@@ -824,66 +818,7 @@ void header_parse(FILE *stream)
 
 		l = c;
 	}
-	if(in_header) {
-		if(l == '\n') {
-			switch(c) {
-				case ' ':
-				case '\t':
-						/* Must insert '\r' before '\n's embedded in header
-						   fields otherwise qmail won't accept our mail
-						   because a bare '\n' violates some RFC */
-						
-						*(q - 1) = '\r';	/* Replace previous \n with \r */
-						*q++ = '\n';		/* Insert \n */
-						len++;
-						
-						break;
-
-				case '\n':
-						in_header = False;
-
-				default:
-						*q = 0;
-						if((q = strrchr(p, '\n'))) {
-							*q = 0;
-						}
-						header_save(p);
-
-						q = p;
-						len = 0;
-			}
-		}
-	}
 	(void)free(p);
-}
-
-/*
- * This is much like strtok, but does not modify the string
- * argument.
- * Args: 
- * 	char **s:
- * 		Address of the pointer to the string we are looking at.
- * 	const char *delim:
- * 		The set of delimiters.
- * Return value:
- *	The first token, copied by strndup (caller have to free it),
- * 	if a token is found, or NULL if isn't (os strndup fails)
- * 	*s points to the rest of the string
- */
-char *firsttok(char **s, const char *delim)
-{
-	char *tok;
-	char *rest;
-	rest=strpbrk(*s,delim);
-	if (!rest) {
-		return NULL;
-	}
-	tok=strndup(*s,rest-(*s));
-	if (!tok) {
-		die("firsttok() -- strndup() failed");
-	}
-	*s=rest+1;
-	return tok;
 }
 
 /*
@@ -894,35 +829,22 @@ bool_t read_config()
 	char buf[(BUF_SZ + 1)], *p, *q, *r;
 	FILE *fp;
 
-	if(config_file == (char *)NULL) {
-		config_file = strdup(CONFIGURATION_FILE);
-		if(config_file == (char *)NULL) {
-			die("parse_config() -- strdup() failed");
-		}
-	}
-
-	if((fp = fopen(config_file, "r")) == NULL) {
+	if((fp = fopen(config_file_path, "r")) == NULL) {
 		return(False);
 	}
 
 	while(fgets(buf, sizeof(buf), fp)) {
-		char *begin=buf;
-		char *rightside;
 		/* Make comments invisible */
 		if((p = strchr(buf, '#'))) {
-			*p = 0;
+			*p = '\0';
 		}
 
 		/* Ignore malformed lines and comments */
 		if(strchr(buf, '=') == (char *)NULL) continue;
 
 		/* Parse out keywords */
-		p=firsttok(&begin, "= \t\n");
-		if(p){
-			rightside=begin;
-			q = firsttok(&begin, "= \t\n");
-		}
-		if(p && q) {
+		if(((p = strtok(buf, "= \t\n")) != (char *)NULL)
+			&& ((q = strtok(NULL, "= \t\n:")) != (char *)NULL)) {
 			if(strcasecmp(p, "Root") == 0) {
 				if((root = strdup(q)) == (char *)NULL) {
 					die("parse_config() -- strdup() failed");
@@ -933,13 +855,12 @@ bool_t read_config()
 				}
 			}
 			else if(strcasecmp(p, "MailHub") == 0) {
-				if((r = strchr(q, ':')) != NULL) {
-					*r++ = '\0';
-					port = atoi(r);
-				}
-
 				if((mailhost = strdup(q)) == (char *)NULL) {
 					die("parse_config() -- strdup() failed");
+				}
+
+				if((r = strtok(NULL, "= \t\n:")) != NULL) {
+					port = atoi(r);
 				}
 
 				if(log_level > 0) {
@@ -948,25 +869,12 @@ bool_t read_config()
 				}
 			}
 			else if(strcasecmp(p, "HostName") == 0) {
-				free(hostname);
-				hostname = strdup(q);
-				if (!hostname) {
-					die("parse_config() -- strdup() failed");
+				if(strncpy(hostname, q, MAXHOSTNAMELEN) == NULL) {
+					die("parse_config() -- strncpy() failed");
 				}
 
 				if(log_level > 0) {
 					log_event(LOG_INFO, "Set HostName=\"%s\"\n", hostname);
-				}
-			}
-			else if(strcasecmp(p,"AddHeader") == 0) {
-				if((r = firsttok(&rightside, "\n#")) != NULL) {
-					header_save(r);
-					free(r);
-				} else {
-					die("cannot AddHeader");
-				}
-				if(log_level > 0 ) {
-					log_event(LOG_INFO, "Set AddHeader=\"%s\"\n", q);
 				}
 			}
 #ifdef REWRITE_DOMAIN
@@ -1096,31 +1004,6 @@ bool_t read_config()
 					log_event(LOG_INFO, "Set AuthMethod=\"%s\"\n", auth_method);
 				}
 			}
-			else if(strcasecmp(p, "UseOldAUTH") == 0) {
-				if(strcasecmp(q, "YES") == 0) {
-					use_oldauth = True;
-				}
-				else {
-					use_oldauth = False;
-				}
- 
-				if(log_level > 0) {
-					log_event(LOG_INFO,
-						"Set UseOldAUTH=\"%s\"\n",
-						use_oldauth ? "True" : "False");
-				}
-			}
-			else if (strcasecmp(p, "Debug") == 0)
-			{
-				if (strcasecmp(q, "YES") == 0)
-				{
-					log_level = 1;
-				}
-				else
-				{
-					log_level = 0;
-				}
-			}
 			else if (strcasecmp(p, "ConnectTimeout") == 0)
 			{
 				connect_timeout = atoi(q); 
@@ -1136,9 +1019,7 @@ bool_t read_config()
 			else {
 				log_event(LOG_INFO, "Unable to set %s=\"%s\"\n", p, q);
 			}
-			free(p);
-			free(q);
-		} 
+		}
 	}
 	(void)fclose(fp);
 
@@ -1150,6 +1031,7 @@ smtp_open() -- Open connection to a remote SMTP listener
 */
 int smtp_open(char *host, int port)
 {
+	int fd_flags;
 #ifdef INET6
 	struct addrinfo hints, *ai0, *ai;
 	char servname[NI_MAXSERV];
@@ -1157,9 +1039,8 @@ int smtp_open(char *host, int port)
 #else
 	struct sockaddr_in name;
 	struct hostent *hent;
-	int i, s, namelen;
+	int s, namelen;
 #endif
-	int fd_flags;
 
 #ifdef HAVE_SSL
 	int err;
@@ -1216,6 +1097,7 @@ int smtp_open(char *host, int port)
 			continue;
 		}
 
+#ifdef CONNECT_TIMEOUT
 		fd_flags = fcntl(s, F_GETFL, 0);
 		if (fcntl(s, F_SETFL, fd_flags | O_NONBLOCK) != 0) {
 			s = -1;
@@ -1248,6 +1130,13 @@ int smtp_open(char *host, int port)
 					goto out_of_loop;
 			}
 		}
+#else
+		if (connect(s, ai->ai_addr, ai->ai_addrlen) < 0) {
+			s = -1;
+			continue;
+		}
+#endif
+		break;
 	}
 
 out_of_loop:
@@ -1276,50 +1165,46 @@ out_of_loop:
 		return(-1);
 	}
 
+	/* This SHOULD already be in Network Byte Order from gethostbyname() */
+	name.sin_addr.s_addr = ((struct in_addr *)(hent->h_addr))->s_addr;
+	name.sin_family = hent->h_addrtype;
+	name.sin_port = htons(port);
+
+	namelen = sizeof(struct sockaddr_in);
+
+#ifdef CONNECT_TIMEOUT
 	fd_flags = fcntl(s, F_GETFL, 0);
 	if (fcntl(s, F_SETFL, fd_flags | O_NONBLOCK) != 0) {
-		log_event(LOG_ERR, "fcntl() failed: %s", strerror(errno));
+		log_event(LOG_ERR, "fcntl(, O_NONBLOCK) failed");
 		return(-1);
 	}
 
-	for (i = 0; ; ++i) {
-		if (!hent->h_addr_list[i]) {
-			log_event(LOG_ERR, "Unable to connect to %s:%d", host, port);
-			return(-1);
+	while (1) {
+		if(connect(s, (struct sockaddr *)&name, namelen) == 0) {
+			goto out_of_loop;
 		}
 
-		/* This SHOULD already be in Network Byte Order from gethostbyname() */
-		name.sin_addr.s_addr = ((struct in_addr *)(hent->h_addr_list[i]))->s_addr;
-		name.sin_family = hent->h_addrtype;
-		name.sin_port = htons(port);
+		switch(errno) {
+			case EALREADY:
+			case EINPROGRESS:
+				{
+					int poll_res;
 
-		namelen = sizeof(struct sockaddr_in);
-
-		while (1) {
-			if(connect(s, (struct sockaddr *)&name, namelen) == 0) {
-				goto out_of_loop;
-			}
-
-			switch(errno) {
-				case EALREADY:
-				case EINPROGRESS:
-					{
-						int poll_res;
-
-						poll_res = ssmtp_poll(s, POLLOUT, connect_timeout);
-						if (poll_res == SSMTP_POLL_SUCCESS) {
-							/* try again */
-							continue;
-						}
-						s = -1;
-						goto out_of_loop;
+					poll_res = ssmtp_poll(s, POLLOUT, connect_timeout);
+					if (poll_res == SSMTP_POLL_SUCCESS) {
+						/* try again */
+						continue;
 					}
-				case EINTR:
-					continue;
-				default:
 					s = -1;
+					log_event(LOG_ERR, "connect(%s:%d) timed out", host, port);
 					goto out_of_loop;
-			}
+				}
+			case EINTR:
+				continue;
+			default:
+				s = -1;
+				log_event(LOG_ERR, "poll() failed on connect");
+				goto out_of_loop;
 		}
 	}
 
@@ -1328,6 +1213,13 @@ out_of_loop:
 		log_event(LOG_ERR, "Unable to connect to %s:%d", host, port);
 		return(-1);
 	}
+
+#else
+	if(connect(s, (struct sockaddr *)&name, namelen) < 0) {
+		log_event(LOG_ERR, "Unable to connect to %s:%d", host, port);
+		return(-1);
+	}
+#endif
 #endif
 
 #ifdef HAVE_SSL
@@ -1397,6 +1289,7 @@ fd_getc() -- Read a character from an fd
 */
 ssize_t fd_getc(int fd, void *c)
 {
+#ifdef READ_TIMEOUT
 	int read_bytes;
 
 	while (1) {
@@ -1409,6 +1302,7 @@ ssize_t fd_getc(int fd, void *c)
 #ifdef HAVE_SSL
 		}
 #endif
+
 		if (read_bytes == -1) {
 			switch (errno) {
 				case EAGAIN:
@@ -1419,15 +1313,25 @@ ssize_t fd_getc(int fd, void *c)
 						if (res == SSMTP_POLL_SUCCESS) {
 							continue;
 						}
+						log_event(LOG_ERR, "read() timed out");
 						return -1;
 					}
 				default:
+					log_event(LOG_ERR, "poll() failed on read");
 					return -1;
 			}
 		} else {
 			return read_bytes;
 		}
 	}
+#else
+#ifdef HAVE_SSL
+	if(use_tls == True) { 
+		return(SSL_read(ssl, c, 1));
+	}
+#endif
+	return(read(fd, c, 1));
+#endif
 }
 
 /*
@@ -1447,7 +1351,7 @@ char *fd_gets(char *buf, int size, int fd)
 			buf[i++] = c;
 		}
 	}
-	buf[i] = 0;
+	buf[i] = '\0';
 
 	return(buf);
 }
@@ -1489,6 +1393,7 @@ fd_puts() -- Write characters to fd
 */
 ssize_t fd_puts(int fd, const void *buf, size_t count) 
 {
+#ifdef WRITE_TIMEOUT
 	int written_bytes, written_bytes_total = 0;
 
 	while (count > 0) {
@@ -1502,7 +1407,7 @@ ssize_t fd_puts(int fd, const void *buf, size_t count)
 		}
 #endif
 
-		if (written_bytes == -1) {
+		if (written_bytes < 0) {
 			switch (errno) {
 				case EAGAIN:
 					{
@@ -1524,19 +1429,26 @@ ssize_t fd_puts(int fd, const void *buf, size_t count)
 		}
 	}
 	return written_bytes_total;
+#else
+#ifdef HAVE_SSL
+	if(use_tls == True) { 
+		return(SSL_write(ssl, buf, count));
+	}
+#endif
+	return(write(fd, buf, count));
+#endif
 }
 
 /*
 smtp_write() -- A printf to an fd and append <CR/LF>
 */
-ssize_t smtp_write(int fd, char *format, ...)
+void smtp_write(int fd, char *format, ...)
 {
-	char buf[(BUF_SZ + 2)];
+	char buf[(BUF_SZ + 1)];
 	va_list ap;
-	ssize_t outbytes = 0;
 
 	va_start(ap, format);
-	if(vsnprintf(buf, (BUF_SZ - 1), format, ap) == -1) {
+	if(vsnprintf(buf, (BUF_SZ - 2), format, ap) == -1) {
 		die("smtp_write() -- vsnprintf() failed");
 	}
 	va_end(ap);
@@ -1550,9 +1462,7 @@ ssize_t smtp_write(int fd, char *format, ...)
 	}
 	(void)strcat(buf, "\r\n");
 
-	outbytes = fd_puts(fd, buf, strlen(buf));
-	
-	return (outbytes >= 0) ? outbytes : 0;
+	(void)fd_puts(fd, buf, strlen(buf));
 }
 
 /*
@@ -1574,20 +1484,13 @@ ssmtp() -- send the message (exactly one) from stdin to the mailhub SMTP port
 */
 int ssmtp(char *argv[])
 {
-	char b[(BUF_SZ + 2)], *buf = b+1, *p, *q;
+	char buf[(BUF_SZ + 1)], *p, *q;
 #ifdef MD5AUTH
 	char challenge[(BUF_SZ + 1)];
 #endif
 	struct passwd *pw;
 	int i, sock;
 	uid_t uid;
-	bool_t minus_v_save, leadingdot, linestart = True;
-	int timeout = 0;
-	int bufsize = sizeof(b)-1;
-
-	b[0] = '.';
-	outbytes = 0;
-	ht = &headers;
 
 	uid = getuid();
 	if((pw = getpwuid(uid)) == (struct passwd *)NULL) {
@@ -1596,7 +1499,7 @@ int ssmtp(char *argv[])
 	get_arpadate(arpadate);
 
 	if(read_config() == False) {
-		log_event(LOG_INFO, "%s not found", config_file);
+		log_event(LOG_INFO, "%s/ssmtp.conf not found", SSMTPCONFDIR);
 	}
 
 	if((p = strtok(pw->pw_gecos, ";,"))) {
@@ -1611,6 +1514,7 @@ int ssmtp(char *argv[])
 		uad = append_domain(pw->pw_name);
 	}
 
+	ht = &headers;
 	rt = &rcpt_list;
 
 	header_parse(stdin);
@@ -1641,10 +1545,10 @@ int ssmtp(char *argv[])
 
 	/* If user supplied username and password, then try ELHO */
 	if(auth_user) {
-		outbytes += smtp_write(sock, "EHLO %s", hostname);
+		smtp_write(sock, "EHLO %s", hostname);
 	}
 	else {
-		outbytes += smtp_write(sock, "HELO %s", hostname);
+		smtp_write(sock, "HELO %s", hostname);
 	}
 	(void)alarm((unsigned) MEDWAIT);
 
@@ -1659,8 +1563,8 @@ int ssmtp(char *argv[])
 			auth_pass = strdup("");
 		}
 
-		if(auth_method && strcasecmp(auth_method, "cram-md5") == 0) {
-			outbytes += smtp_write(sock, "AUTH CRAM-MD5");
+		if(strcasecmp(auth_method, "cram-md5") == 0) {
+			smtp_write(sock, "AUTH CRAM-MD5");
 			(void)alarm((unsigned) MEDWAIT);
 
 			if(smtp_read(sock, buf) != 3) {
@@ -1668,44 +1572,26 @@ int ssmtp(char *argv[])
 			}
 			strncpy(challenge, strchr(buf,' ') + 1, sizeof(challenge));
 
-			memset(buf, 0, bufsize);
+			memset(buf, 0, sizeof(buf));
 			crammd5(challenge, auth_user, auth_pass, buf);
 		}
 		else {
 #endif
-		memset(buf, 0, bufsize);
-		to64frombits((unsigned char *)buf, (unsigned char *)auth_user, strlen(auth_user));
-		if (use_oldauth) {
-			outbytes += smtp_write(sock, "AUTH LOGIN %s", buf);
-		}
-		else {
-			outbytes += smtp_write(sock, "AUTH LOGIN");
-			(void)alarm((unsigned) MEDWAIT);
-			if(smtp_read(sock, buf) != 3) {
-				die("Server didn't like our AUTH LOGIN (%s)", buf);
-			}
-			/* we assume server asked us for Username */
-			memset(buf, 0, bufsize);
-			to64frombits((unsigned char *)buf, (unsigned char *)auth_user, strlen(auth_user));
-			outbytes += smtp_write(sock, buf);
-		}
+		memset(buf, 0, sizeof(buf));
+		to64frombits(buf, auth_user, strlen(auth_user));
+		smtp_write(sock, "AUTH LOGIN %s", buf);
 
 		(void)alarm((unsigned) MEDWAIT);
 		if(smtp_read(sock, buf) != 3) {
 			die("Server didn't accept AUTH LOGIN (%s)", buf);
 		}
-		memset(buf, 0, bufsize);
+		memset(buf, 0, sizeof(buf));
 
-		to64frombits((unsigned char *)buf, (unsigned char *)auth_pass, strlen(auth_pass));
+		to64frombits(buf, auth_pass, strlen(auth_pass));
 #ifdef MD5AUTH
 		}
 #endif
-		/* We do NOT want the password output to STDERR
-		 * even base64 encoded.*/
-		minus_v_save = minus_v;
-		minus_v = False;
-		outbytes += smtp_write(sock, "%s", buf);
-		minus_v = minus_v_save;
+		smtp_write(sock, "%s", buf);
 		(void)alarm((unsigned) MEDWAIT);
 
 		if(smtp_okay(sock, buf) == False) {
@@ -1714,7 +1600,7 @@ int ssmtp(char *argv[])
 	}
 
 	/* Send "MAIL FROM:" line */
-	outbytes += smtp_write(sock, "MAIL FROM:<%s>", uad);
+	smtp_write(sock, "MAIL FROM:<%s>", uad);
 
 	(void)alarm((unsigned) MEDWAIT);
 
@@ -1732,7 +1618,7 @@ int ssmtp(char *argv[])
 
 		while(rt->next) {
 			p = rcpt_remap(rt->string);
-			outbytes += smtp_write(sock, "RCPT TO:<%s>", p);
+			smtp_write(sock, "RCPT TO:<%s>", p);
 
 			(void)alarm((unsigned)MEDWAIT);
 
@@ -1749,7 +1635,7 @@ int ssmtp(char *argv[])
 			while(p) {
 				/* RFC822 Address -> "foo@bar" */
 				q = rcpt_remap(addr_parse(p));
-				outbytes += smtp_write(sock, "RCPT TO:<%s>", q);
+				smtp_write(sock, "RCPT TO:<%s>", q);
 
 				(void)alarm((unsigned) MEDWAIT);
 
@@ -1763,7 +1649,7 @@ int ssmtp(char *argv[])
 	}
 
 	/* Send DATA */
-	outbytes += smtp_write(sock, "DATA");
+	smtp_write(sock, "DATA");
 	(void)alarm((unsigned) MEDWAIT);
 
 	if(smtp_read(sock, buf) != 3) {
@@ -1771,89 +1657,59 @@ int ssmtp(char *argv[])
 		die("%s", buf);
 	}
 
-	outbytes += smtp_write(sock,
+	smtp_write(sock,
 		"Received: by %s (sSMTP sendmail emulation); %s", hostname, arpadate);
 
 	if(have_from == False) {
-		outbytes += smtp_write(sock, "From: %s", from);
+		smtp_write(sock, "From: %s", from);
 	}
 
 	if(have_date == False) {
-		outbytes += smtp_write(sock, "Date: %s", arpadate);
+		smtp_write(sock, "Date: %s", arpadate);
 	}
 
 #ifdef HASTO_OPTION
 	if(have_to == False) {
-		outbytes += smtp_write(sock, "To: postmaster");
+		smtp_write(sock, "To: postmaster");
 	}
 #endif
 
 	ht = &headers;
 	while(ht->next) {
-		outbytes += smtp_write(sock, "%s", ht->string);
+		smtp_write(sock, "%s", ht->string);
 		ht = ht->next;
 	}
 
 	(void)alarm((unsigned) MEDWAIT);
 
 	/* End of headers, start body */
-	outbytes += smtp_write(sock, "");
+	smtp_write(sock, "");
 
-	/*prevent blocking on pipes, we really shouldnt be using
-	  stdio functions like fgets in the first place */
-	fcntl(STDIN_FILENO,F_SETFL,O_NONBLOCK);
-
-	while(!feof(stdin)) {
-		if (!fgets(buf, bufsize, stdin)) {
-			/* if nothing was received, then no transmission
-			 * over smtp should be done */
-			sleep(1);
-			/* don't hang forever when reading from stdin */
-			if (++timeout >= MEDWAIT) {
-				log_event(LOG_ERR, "killed: timeout on stdin while reading body -- message saved to dead.letter.");
-				die("Timeout on stdin while reading body");
-			}
-			continue;
-		}
+	while(fgets(buf, sizeof(buf), stdin)) {
 		/* Trim off \n, double leading .'s */
-		leadingdot = standardise(buf, &linestart);
+		standardise(buf);
 
-		if (linestart || feof(stdin)) {
-			linestart = True;
-			outbytes += smtp_write(sock, "%s", leadingdot ? b : buf);
-		} else {
-			if (log_level > 0) {
-				log_event(LOG_INFO, "Sent a very long line in chunks");
-			}
-			if (leadingdot) {
-				outbytes += fd_puts(sock, b, sizeof(b));
-			} else {
-				outbytes += fd_puts(sock, buf, bufsize);
-			}
-		}
+		smtp_write(sock, "%s", buf);
+
 		(void)alarm((unsigned) MEDWAIT);
-	}
-	if(!linestart) {
-		smtp_write(sock, "");
 	}
 	/* End of body */
 
-	outbytes += smtp_write(sock, ".");
+	smtp_write(sock, ".");
 	(void)alarm((unsigned) MAXWAIT);
 
 	if(smtp_okay(sock, buf) == 0) {
 		die("%s", buf);
 	}
 
-	/* Close connection */
+	/* Close conection */
 	(void)signal(SIGALRM, SIG_IGN);
 
-	outbytes += smtp_write(sock, "QUIT");
+	smtp_write(sock, "QUIT");
 	(void)smtp_okay(sock, buf);
 	(void)close(sock);
 
-	log_event(LOG_INFO, "Sent mail for %s (%s) uid=%d username=%s outbytes=%d", 
-		from_strip(uad), buf, uid, pw->pw_name, outbytes);
+	log_event(LOG_INFO, "Sent mail for %s (%s)", from_strip(uad), buf);
 
 	return(0);
 }
@@ -1994,18 +1850,12 @@ char **parse_options(int argc, char *argv[])
 
 			/* Configfile name */
 			case 'C':
-				if((!argv[i][(j + 1)]) && argv[(i + 1)]) {
-					config_file = strdup(argv[(i + 1)]);
-					if(config_file == (char *)NULL) {
-						die("parse_options() -- strdup() failed");
-					}
-					add++;
+				if (argv[i][++j]) {
+					config_file_path = strdup(argv[i] + j);
 				}
 				else {
-					config_file = strdup(argv[i]+j+1);
-					if(config_file == (char *)NULL) {
-						die("parse_options() -- strdup() failed");
-					}
+					config_file_path = strdup(argv[i+1]);
+					add ++;
 				}
 				goto exit;
 
@@ -2234,10 +2084,7 @@ int main(int argc, char **argv)
 	/* Set the globals */
 	prog = basename(argv[0]);
 
-	hostname = xgethostname();
-
-	if(!hostname) {
-		perror("xgethostname");
+	if(gethostname(hostname, MAXHOSTNAMELEN) == -1) {
 		die("Cannot get the name of this machine");
 	}
 	new_argv = parse_options(argc, argv);
