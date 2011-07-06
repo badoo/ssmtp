@@ -67,6 +67,7 @@ char *mail_domain = NULL;
 char *from = NULL;		/* Use this as the From: address */
 char hostname[MAXHOSTNAMELEN] = "localhost";
 char *mailhost = "mailhub";
+int mailhost_cmdline = 0;
 char *minus_f = NULL;
 char *minus_F = NULL;
 char *gecos;
@@ -854,7 +855,7 @@ bool_t read_config()
 					log_event(LOG_INFO, "Set Root=\"%s\"\n", root);
 				}
 			}
-			else if(strcasecmp(p, "MailHub") == 0) {
+			else if(strcasecmp(p, "MailHub") == 0 && !mailhost_cmdline) {
 				if((mailhost = strdup(q)) == (char *)NULL) {
 					die("parse_config() -- strdup() failed");
 				}
@@ -1399,10 +1400,10 @@ ssize_t fd_puts(int fd, const void *buf, size_t count)
 	while (count > 0) {
 #ifdef HAVE_SSL
 		if(use_tls == True) { 
-			written_bytes = SSL_write(ssl, buf, count);
+			written_bytes = SSL_write(ssl, buf + written_bytes_total, count);
 		} else {
 #endif
-			written_bytes = write(fd, buf, count);
+			written_bytes = write(fd, buf + written_bytes_total, count);
 #ifdef HAVE_SSL
 		}
 #endif
@@ -1430,12 +1431,31 @@ ssize_t fd_puts(int fd, const void *buf, size_t count)
 	}
 	return written_bytes_total;
 #else
+	int fd_flags, ret;
+
+	fd_flags = fcntl(fd, F_GETFL, 0);
+	if (fcntl(fd, F_SETFL, fd_flags &~ O_NONBLOCK) != 0) {
+		log_event(LOG_ERR, "fcntl(, ) failed");
+		return(-1);
+	}
+
 #ifdef HAVE_SSL
 	if(use_tls == True) { 
-		return(SSL_write(ssl, buf, count));
+		ret = SSL_write(ssl, buf, count));
+		if (fcntl(fd, F_SETFL, fd_flags | O_NONBLOCK) != 0) {
+			log_event(LOG_ERR, "fcntl(, ) failed");
+			return(-1);
+		}
+		return ret;
 	}
 #endif
-	return(write(fd, buf, count));
+	ret = write(fd, buf, count);
+
+	if (fcntl(fd, F_SETFL, fd_flags | O_NONBLOCK) != 0) {
+		log_event(LOG_ERR, "fcntl(, ) failed");
+		return(-1);
+	}
+	return ret;
 #endif
 }
 
@@ -1858,6 +1878,20 @@ char **parse_options(int argc, char *argv[])
 					add ++;
 				}
 				goto exit;
+
+				/* mailhost address */
+			case 'I':
+				if((mailhost = strdup(argv[i+1])) != (char *)NULL) {
+					char *r;
+					if((r = strchr(mailhost, ':')) != NULL) {
+						port = atoi(++r);
+					}
+					mailhost_cmdline = 1;
+					if (new_argc > 0) {
+						new_argc--;
+					}
+				}
+				continue;
 
 			/* Debug */
 			case 'd':
