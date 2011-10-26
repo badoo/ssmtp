@@ -1597,17 +1597,17 @@ int ssmtp(char *argv[])
 		}
 		else {
 #endif
-		memset(buf, 0, sizeof(buf));
-		to64frombits(buf, auth_user, strlen(auth_user));
-		smtp_write(sock, "AUTH LOGIN %s", buf);
+		    memset(buf, 0, sizeof(buf));
+		    to64frombits(buf, auth_user, strlen(auth_user));
+		    smtp_write(sock, "AUTH LOGIN %s", buf);
 
-		(void)alarm((unsigned) MEDWAIT);
-		if(smtp_read(sock, buf) != 3) {
+		    (void)alarm((unsigned) MEDWAIT);
+		    if(smtp_read(sock, buf) != 3) {
 			die("Server didn't accept AUTH LOGIN (%s)", buf);
-		}
-		memset(buf, 0, sizeof(buf));
+		    }
+		    memset(buf, 0, sizeof(buf));
 
-		to64frombits(buf, auth_pass, strlen(auth_pass));
+		    to64frombits(buf, auth_pass, strlen(auth_pass));
 #ifdef MD5AUTH
 		}
 #endif
@@ -1719,7 +1719,7 @@ int ssmtp(char *argv[])
 	(void)alarm((unsigned) MAXWAIT);
 
 	if(smtp_okay(sock, buf) == 0) {
-		die("%s", buf);
+	    die("%s", buf);
 	}
 
 	/* Close conection */
