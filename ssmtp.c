@@ -1509,7 +1509,7 @@ int ssmtp(char *argv[])
 	char challenge[(BUF_SZ + 1)];
 #endif
 	struct passwd *pw;
-	int i, sock;
+	int i, sock, res;
 	uid_t uid;
 
 	uid = getuid();
@@ -1643,7 +1643,7 @@ int ssmtp(char *argv[])
 			(void)alarm((unsigned)MEDWAIT);
 
 			if(smtp_okay(sock, buf) == 0) {
-				die("RCPT TO:<%s> (%s)", p, buf);
+				die("%s", buf);
 			}
 
 			rt = rt->next;
@@ -1660,7 +1660,7 @@ int ssmtp(char *argv[])
 				(void)alarm((unsigned) MEDWAIT);
 
 				if(smtp_okay(sock, buf) == 0) {
-					die("RCPT TO:<%s> (%s)", q, buf);
+					die("%s", buf);
 				}
 
 				p = strtok(NULL, ",");
@@ -1718,8 +1718,12 @@ int ssmtp(char *argv[])
 	smtp_write(sock, ".");
 	(void)alarm((unsigned) MAXWAIT);
 
-	if(smtp_okay(sock, buf) == 0) {
-	    die("%s", buf);
+	res = smtp_okay(sock, buf);
+	/* always output the final reply from the MTA */
+	fprintf(stdout, "%s: %s\n", prog, buf);
+
+	if(res == 0) {
+	    die("%s", "");
 	}
 
 	/* Close conection */
