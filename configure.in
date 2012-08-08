@@ -22,6 +22,13 @@ AC_CACHE_CHECK([for obsolete openlog],ssmtp_cv_obsolete_openlog,
 dnl Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
 AC_STRUCT_TM
+AC_CHECK_SIZEOF(long int, 4)
+if test "$ac_cv_sizeof_long_int" = "8"; then
+	SSMTP_LIBDIR=lib64
+else
+	SSMTP_LIBDIR=lib
+fi
+
 
 dnl Checks for libraries.
 AC_CHECK_LIB(nsl, gethostname)
@@ -55,23 +62,39 @@ AC_ARG_WITH(openssl,
                           PATH to openssl install (default /usr/local) ],
 [
     if test x$withval = xyes ; then
-        tryopenssldir="/usr/local"
+        tryopenssldir="/usr /usr/local"
     else
         tryopenssldir=$withval
     fi
-    AC_MSG_CHECKING([for openssl])
-    LDFLAGS="$LDFLAGS -L$tryopenssldir/lib"
-    LIBS="$LIBS -lssl -lcrypto"
-    CFLAGS="$CFLAGS -I$tryopenssldir/include"
 
-    AC_TRY_LINK([#include <openssl/ssl.h>], [SSL_library_init();],
-        [ AC_MSG_RESULT([yes]) ],
-        [ AC_MSG_ERROR([Unable to link with the openssl library.
-                    If it is installed, specify its path using --with-openssl=/dir])
-        ])
+	for dir in $tryopenssldir; do
+		AC_MSG_CHECKING([for OpenSSL in $dir])
+		old_LDFLAGS=$LDFLAGS
+		LDFLAGS="$LDFLAGS -L$dir/$SSMTP_LIBDIR"
+		old_LIBS=$LIBS
+		LIBS="$LIBS -L$dir/$SSMTP_LIBDIR -lssl -lcrypto"
+		old_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS -I$dir/include"
 
-    AC_DEFINE(HAVE_SSL)
-    OPENSSL_ENABLED="yes"
+		AC_TRY_LINK([#include <openssl/ssl.h>], [SSL_library_init();],
+		[ AC_MSG_RESULT([yes])
+		  AC_DEFINE(HAVE_SSL)
+		  OPENSSL_ENABLED="yes"
+		],
+		[ AC_MSG_RESULT([not found]) ])
+
+		if test "x$OPENSSL_ENABLED" = "xyes"; then
+			break;
+		fi
+		LDFLAGS=$old_CFLAGS
+		LIBS=$old_LIBS
+		CFLAGS=$old_CFLAGS
+	done;
+
+	if test "x$OPENSSL_ENABLED" != "xyes"; then
+		AC_MSG_ERROR([Unable to find the OpenSSL library in '$tryopenssldir'.
+					  If it is installed, specify its path using --with-openssl=/dir])
+	fi
 ]
 )
 
@@ -85,22 +108,51 @@ AC_ARG_WITH(cyassl,
 if test "$OPENSSL_ENABLED" != "yes"; then
 
     if test x$withval = xyes ; then
-        trycyassldir="/usr/local"
+        trycyassldir="/usr /usr/local"
     else
         trycyassldir=$withval
     fi
-    AC_MSG_CHECKING([for cyassl])
-    LDFLAGS="$LDFLAGS -L$trycyassldir/lib"
-    LIBS="$LIBS -lcyassl"
-    CFLAGS="$CFLAGS -I$trycyassldir/include/cyassl"
 
-    AC_TRY_LINK([#include <openssl/ssl.h>], [CyaSSL_Init();],
-        [ AC_MSG_RESULT([yes]) ],
-        [ AC_MSG_ERROR([Unable to link with the CyaSSL library.
-                   You can get it from $CYASSL_URL
-                   If it is installed, specify its path using --with-cyassl=/dir])
-        ])
-    AC_DEFINE(HAVE_SSL)
+	for dir in $trycyassldir; do
+		AC_MSG_CHECKING([for CyaSSL in $dir])
+		old_LDFLAGS=$LDFLAGS
+		LDFLAGS="$LDFLAGS -Wl,-rpath,$dir/$SSMTP_LIBDIR -L$dir/$SSMTP_LIBDIR"
+		old_LIBS=$LIBS
+		LIBS="$LIBS -L$dir/$SSMTP_LIBDIR -lcyassl"
+		old_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS -I$dir/include/cyassl -I$dir/include"
+
+		AC_TRY_LINK([#include <cyassl/ssl.h>], [CyaSSL_Init();],
+		[ AC_MSG_RESULT([yes])
+		  AC_DEFINE(HAVE_SSL)
+		  CYASSL_ENABLED="yes"
+		],
+		[ AC_MSG_RESULT([not found]) ])
+
+		if test "x$CYASSL_ENABLED" = "xyes"; then
+			break;
+		fi
+		LDFLAGS=$old_CFLAGS
+		LIBS=$old_LIBS
+		CFLAGS=$old_CFLAGS
+	done;
+
+	if test "x$CYASSL_ENABLED" != "xyes"; then
+		AC_MSG_ERROR([Unable to find the CyaSSL library in '$trycyassldir'.
+					  If it is installed, specify its path using --with-cyassl=/dir])
+	fi
+
+	AC_MSG_CHECKING([if CyaSSL is configured properly])
+	AC_TRY_LINK([#include <cyassl/openssl/ssl.h>], [SSLeay_add_ssl_algorithms();],
+	[ AC_MSG_RESULT([yes])
+	AC_DEFINE(HAVE_SSL)
+	CYASSL_ENABLED="yes"
+	],
+	[
+		AC_MSG_ERROR([Unable to link with CyaSSL library in '$trycyassldir'.
+					  Make sure it's configured with --enable-opensslExtra flag])
+	])
+
 fi
 ]
 )
