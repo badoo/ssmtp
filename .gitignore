@@ -3,4 +3,5 @@ Makefile
 *.cache
 *.log
 *.status
+configure
 ssmtp
